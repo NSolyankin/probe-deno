@@ -1,26 +1,48 @@
-// Разведочный прокси-эндпоинт на Deno Deploy.
-// Цель: узнать, проходит ли ТСПУ запросы к *.deno.dev.
+// Полноценный прозрачный прокси Supabase на Deno Deploy.
+// Принимает любой путь и проксирует на Supabase.
 //
-// Маршруты:
-//   GET  /healthcheck   -> {"ok":true,"platform":"deno"}
-//   GET  /test-supabase -> результат GET-запроса к Supabase
-//   POST /test-echo     -> возвращает тело запроса обратно
+// Маршрутизация (на уровне Deno.serve, без отдельных rewrites):
+//   /healthcheck        -> локальный быстрый ответ, без Supabase
+//   /auth/v1/token      -> Supabase /auth/v1/token
+//   /rest/v1/profiles   -> Supabase /rest/v1/profiles
+//   /                   -> healthcheck
+//
+// CORS: эхо запрошенных заголовков (как в текущем Cloudflare Worker).
 
 const SUPABASE_URL = 'https://nxxjbiwrkrlylpfypzvi.supabase.co';
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': '*',
-  'Access-Control-Max-Age': '86400'
-};
+// Заголовки запроса, которые лучше не передавать в Supabase.
+const SKIP_REQUEST_HEADERS = new Set([
+  'host', 'connection', 'content-length',
+  'cf-ray', 'cf-connecting-ip', 'cf-ipcountry', 'cf-visitor',
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+  'x-real-ip', 'forwarded'
+]);
 
-function jsonResponse(obj, status = 200) {
+// Заголовки ответа, которые мы не возвращаем клиенту.
+const HOP_BY_HOP_RESPONSE = new Set([
+  'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer',
+  'upgrade', 'proxy-authorization', 'proxy-authenticate',
+  'content-encoding', 'content-length'
+]);
+
+function corsHeaders(req) {
+  const reqHeaders = req.headers.get('access-control-request-headers') || '*';
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': reqHeaders,
+    'Access-Control-Expose-Headers': '*',
+    'Access-Control-Max-Age': '86400'
+  };
+}
+
+function jsonResponse(obj, req, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: {
       'Content-Type': 'application/json',
-      ...corsHeaders
+      ...corsHeaders(req)
     }
   });
 }
@@ -28,78 +50,68 @@ function jsonResponse(obj, status = 200) {
 Deno.serve(async (req) => {
   // Preflight CORS
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { status: 204, headers: corsHeaders(req) });
   }
 
   const url = new URL(req.url);
-  const path = url.pathname;
+  const pathName = url.pathname;
 
-  // healthcheck — простой ответ, что прокси жив
-  if (path === '/healthcheck') {
+  // Healthcheck — отдельный быстрый ответ
+  if (pathName === '/healthcheck' || pathName === '/' || pathName === '') {
     return jsonResponse({
       ok: true,
       platform: 'deno',
-      timestamp: new Date().toISOString()
-    });
+      timestamp: new Date().toISOString(),
+      version: 'proxy-v1'
+    }, req);
   }
 
-  // test-supabase — пробуем сходить на Supabase из этого прокси
-  if (path === '/test-supabase') {
-    try {
-      const r = await fetch(SUPABASE_URL + '/rest/v1/', {
-        method: 'GET',
-        headers: { 'Accept': 'application/json' }
-      });
-      const text = await r.text();
-      return jsonResponse({
-        ok: true,
-        platform: 'deno',
-        supabase_status: r.status,
-        supabase_response_preview: text.slice(0, 200)
-      });
-    } catch (e) {
-      return jsonResponse({
-        ok: false,
-        platform: 'deno',
-        error: String(e && e.message || e)
-      }, 500);
-    }
+  // Сборка целевого URL: SUPABASE_URL + pathName + search
+  const targetUrl = SUPABASE_URL + pathName + url.search;
+
+  // Заголовки запроса
+  const fwdHeaders = new Headers();
+  req.headers.forEach((value, key) => {
+    if (SKIP_REQUEST_HEADERS.has(key.toLowerCase())) return;
+    fwdHeaders.set(key, value);
+  });
+
+  // Тело запроса
+  let body = undefined;
+  const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  if (hasBody) {
+    body = await req.arrayBuffer();
+    if (body.byteLength === 0) body = undefined;
   }
 
-  // test-echo — принимает POST с JSON и возвращает обратно
-  if (path === '/test-echo') {
-    if (req.method !== 'POST') {
-      return jsonResponse({ ok: false, error: 'POST required for test-echo' }, 405);
-    }
-    let body = null;
-    try {
-      body = await req.json();
-    } catch {
-      body = null;
-    }
-    return jsonResponse({
-      ok: true,
-      platform: 'deno',
+  try {
+    const upstream = await fetch(targetUrl, {
       method: req.method,
-      received_body: body,
-      headers_seen: {
-        'content-type': req.headers.get('content-type'),
-        'user-agent': req.headers.get('user-agent')
-      }
+      headers: fwdHeaders,
+      body,
+      redirect: 'manual'
     });
-  }
 
-  // Главная страница — краткая справка
-  if (path === '/') {
-    return new Response(
-      'probe-deno: разведочный прокси.\n\n' +
-      'Endpoints:\n' +
-      '  GET  /healthcheck\n' +
-      '  GET  /test-supabase\n' +
-      '  POST /test-echo (JSON body)\n',
-      { headers: { 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders } }
-    );
-  }
+    // Заголовки ответа: сохраняем все, кроме hop-by-hop
+    const respHeaders = new Headers();
+    upstream.headers.forEach((value, key) => {
+      if (HOP_BY_HOP_RESPONSE.has(key.toLowerCase())) return;
+      respHeaders.set(key, value);
+    });
+    // CORS-заголовки поверх
+    Object.entries(corsHeaders(req)).forEach(([k, v]) => respHeaders.set(k, v));
 
-  return jsonResponse({ ok: false, error: 'Unknown path: ' + path }, 404);
+    // Тело ответа — отдаём как есть
+    const respBuf = await upstream.arrayBuffer();
+    return new Response(respBuf, {
+      status: upstream.status,
+      headers: respHeaders
+    });
+  } catch (err) {
+    return jsonResponse({
+      ok: false,
+      platform: 'deno',
+      error: 'Upstream error: ' + (err && err.message || String(err))
+    }, req, 502);
+  }
 });
