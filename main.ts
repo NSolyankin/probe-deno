@@ -26,6 +26,16 @@ const HOP_BY_HOP_RESPONSE = new Set([
   'content-encoding', 'content-length'
 ]);
 
+// HTTP-статусы, для которых тело ответа обязано быть null
+// (по спецификации Fetch / Web API). Если попытаться создать Response
+// с непустым body для такого статуса, runtime бросит ошибку
+// «Response with null body status cannot have body».
+//
+// Supabase отвечает 204 No Content на успешный DELETE — именно из-за
+// этого случая ломалось удаление через прокси. Раньше код всегда читал
+// arrayBuffer() и передавал его в new Response, что для 204 невалидно.
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
 function corsHeaders(req) {
   const reqHeaders = req.headers.get('access-control-request-headers') || '*';
   return {
@@ -62,7 +72,7 @@ Deno.serve(async (req) => {
       ok: true,
       platform: 'deno',
       timestamp: new Date().toISOString(),
-      version: 'proxy-v1'
+      version: 'proxy-v2'
     }, req);
   }
 
@@ -101,9 +111,16 @@ Deno.serve(async (req) => {
     // CORS-заголовки поверх
     Object.entries(corsHeaders(req)).forEach(([k, v]) => respHeaders.set(k, v));
 
-    // Тело ответа — отдаём как есть
-    const respBuf = await upstream.arrayBuffer();
-    return new Response(respBuf, {
+    // Тело ответа: для null-body статусов и для HEAD-запросов передаём null,
+    // иначе runtime бросит ошибку «Response with null body status cannot
+    // have body» при создании Response.
+    // Для всех остальных случаев читаем upstream.arrayBuffer() и пробрасываем.
+    let respBody = null;
+    if (!NULL_BODY_STATUSES.has(upstream.status) && req.method !== 'HEAD') {
+      respBody = await upstream.arrayBuffer();
+    }
+
+    return new Response(respBody, {
       status: upstream.status,
       headers: respHeaders
     });
